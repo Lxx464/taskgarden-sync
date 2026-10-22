@@ -1,0 +1,15 @@
+{
+  "name": "taskgarden-sync",
+  "version": "1.0.0",
+  "description": "A blob store for TaskGarden, so the app can sync without Google Drive.",
+  "type": "module",
+  "license": "MIT",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
+  }
+}
