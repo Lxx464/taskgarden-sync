@@ -19,7 +19,8 @@ import { createServer } from 'node:http';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { createPrivateKey, generateKeyPairSync, sign } from 'node:crypto';
 import { join } from 'node:path';
-import { handle, MAX_BYTES } from './handler.js';
+import { handle, MAX_BYTES, bucketFor, runSchedule } from './handler.js';
+import { encryptPayload } from './webpush.js';
 
 const PORT = Number(process.env.PORT || 8080);
 const DATA_DIR = process.env.SYNC_DATA || '/data';
@@ -77,16 +78,23 @@ async function loadVapid() {
   return {
     publicKey,
     // A wake-up call with no body. Resolves to the push service's status code.
-    async send(subscription) {
+    async send(subscription, payload = null) {
       const aud = new URL(subscription.endpoint).origin;
       const head = b64url(JSON.stringify({ typ: 'JWT', alg: 'ES256' }));
       const claims = b64url(JSON.stringify({ aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: subject }));
       const signature = sign('sha256', Buffer.from(`${head}.${claims}`), { key, dsaEncoding: 'ieee-p1363' });
-      const res = await fetch(subscription.endpoint, {
-        method: 'POST',
-        headers: { Authorization: `vapid t=${head}.${claims}.${b64url(signature)}, k=${publicKey}`, TTL: '3600', Urgency: 'high' },
-        signal: AbortSignal.timeout(10000)
-      });
+      const headers = { Authorization: `vapid t=${head}.${claims}.${b64url(signature)}, k=${publicKey}`, TTL: '3600', Urgency: 'high' };
+      let body;
+      // With the subscriber's keys the text travels sealed; without them the
+      // push is a plain wake-up call and the app shows its fixed notice.
+      if (payload && subscription.keys?.p256dh && subscription.keys?.auth) {
+        try {
+          body = encryptPayload(subscription.keys, JSON.stringify(payload));
+          headers['Content-Encoding'] = 'aes128gcm';
+          headers['Content-Type'] = 'application/octet-stream';
+        } catch (e) { body = undefined; }
+      }
+      const res = await fetch(subscription.endpoint, { method: 'POST', headers, body, signal: AbortSignal.timeout(10000) });
       return res.status;
     }
   };
@@ -143,6 +151,10 @@ const server = createServer(async (req, res) => {
 
 await mkdir(DATA_DIR, { recursive: true });
 const push = await loadVapid();
+// Reminders posted through /push/schedule go out from here.
+setInterval(() => {
+  runSchedule(fileStore, CODES.map(bucketFor), push).catch(e => console.error('schedule error:', e));
+}, 30000).unref();
 server.listen(PORT, () => {
   console.log(`TaskGarden sync on :${PORT}, data in ${DATA_DIR}, ${CODES.length} code(s)`);
 });

@@ -115,25 +115,31 @@ Snapshots above 8 MB are rejected with `413`.
 
 ### Wake-up calls (Web Push)
 
-The service can wake a device whose app is closed. It carries no message, only
-"something is waiting"; the app's service worker decides what to show. Keys are
-made on first start and kept in the data volume (`vapid.json`), so there is
-nothing to configure — the container must be able to reach the browsers' push
-services over HTTPS.
+The service can wake a device whose app is closed and tell it something short.
+Keys are made on first start and kept in the data volume (`vapid.json`), so
+there is nothing to configure. The container must be able to reach the
+browsers' push services over HTTPS.
 
     GET  /push/key          → { "key": "<public key>" }
-    POST /push/subscribe    { subscription, role }      → 204
-    POST /push/unsubscribe  { endpoint }                → 204
-    POST /push/notify       { role?, skip? }            → { sent: n }
+    POST /push/subscribe    { subscription, role }          → 204
+    POST /push/unsubscribe  { endpoint }                    → 204
+    POST /push/notify       { role?, skip?, payload? }      → { sent: n }
+    POST /push/schedule     { items: [{ at, role?, payload }] } → { scheduled: n }
     Authorization: Bearer <pairing code>
+
+A `payload` is a small object of short strings. It is sealed for the one
+browser that subscribed (RFC 8291, `src/webpush.js`), so the push service in
+between only sees ciphertext; a subscription without keys gets an empty
+wake-up call instead.
+
+`schedule` replaces the list of reminders waiting for this code (at most 80,
+at most eight days ahead). A timer in the server sends what is due every 30
+seconds and drops reminders it missed by more than 15 minutes, so a restart
+does not replay last week.
 
 Subscriptions are stored per code (at most ten). One `notify` per code every
 five seconds is answered; more get `429`. A subscription the push service no
-longer knows is dropped on the next `notify`.
-
-The service sends no `ETag` or cache headers. Clients that want to notice a
-change cheaply (TaskGarden's live check) compare a digest of the body
-themselves.
+longer knows is dropped on the next send.
 
 ## Backups
 

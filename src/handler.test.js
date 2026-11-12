@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { bucketFor, corsHeaders, handle } from './handler.js';
+import { bucketFor, corsHeaders, handle, runSchedule } from './handler.js';
 
 const ORIGINS = ['https://todo.celexstrategy.com', 'https://app.example.org'];
 const CODES = ['code-luca', 'code-gast'];
@@ -185,5 +185,46 @@ describe('push', () => {
     expect(again.status).toBe(429);
     const later = await handle(post('/push/notify', {}), store, ctx({ now: () => 5_010_000 }));
     expect(later.status).toBe(200);
+  });
+
+  it('hands a cleaned payload to the push sender', async () => {
+    const store = memoryStore();
+    const got = [];
+    const p = { publicKey: 'PUB', async send(sub, payload) { got.push(payload); return 201; } };
+    await handle(post('/push/subscribe', { role: 'luca', subscription: { endpoint: 'https://push.example/1' } }), store, ctx({ push: p }));
+    await handle(post('/push/notify', { role: 'luca', payload: { k: 'msg', text: 'Hallo', 'bad key': 'x', n: 5 } }), store, ctx({ push: p, now: () => 50_000_000 }));
+    expect(got).toEqual([{ k: 'msg', text: 'Hallo' }]);
+  });
+
+  it('schedules reminders, keeping only future, bounded, well-formed ones', async () => {
+    const store = memoryStore();
+    const t = 1_000_000;
+    const res = await handle(post('/push/schedule', { items: [
+      { at: t + 60_000, role: 'luca', payload: { k: 'rule', text: 'A' } },
+      { at: t - 1, payload: { k: 'rule' } },
+      { at: t + 9 * 24 * 3600 * 1000, payload: { k: 'rule' } },
+      { at: t + 120_000 },
+      { at: 'x', payload: { k: 'rule' } }
+    ] }), store, ctx({ now: () => t }));
+    expect(res.body).toEqual({ scheduled: 1 });
+    expect(store.data[`sched-${bucketFor('code-luca')}`]).toHaveLength(1);
+  });
+
+  it('runSchedule sends what is due, drops what was missed, keeps the future', async () => {
+    const b = bucketFor('code-luca');
+    const t = 10_000_000;
+    const store = memoryStore({
+      [`sched-${b}`]: [
+        { at: t - 20 * 60_000, role: 'luca', payload: { k: 'old' } },
+        { at: t - 1000, role: 'luca', payload: { k: 'due' } },
+        { at: t + 60_000, role: 'luca', payload: { k: 'later' } }
+      ],
+      [`push-${b}`]: [{ endpoint: 'https://push.example/1', role: 'luca' }, { endpoint: 'https://push.example/2', role: 'mia' }]
+    });
+    const got = [];
+    const p = { async send(sub, payload) { got.push([sub.endpoint, payload.k]); return 201; } };
+    expect(await runSchedule(store, [b], p, () => t)).toBe(1);
+    expect(got).toEqual([['https://push.example/1', 'due']]);
+    expect(store.data[`sched-${b}`].map(i => i.payload.k)).toEqual(['later']);
   });
 });

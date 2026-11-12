@@ -19,6 +19,9 @@ const MAX_SUBSCRIPTIONS = 10;
 // One wake-up call per bucket in this window: a client in a loop must not be
 // able to turn this service into a notification cannon.
 const NOTIFY_GAP_MS = 5000;
+const MAX_SCHEDULED = 80;
+const MAX_AHEAD_MS = 8 * 24 * 3600 * 1000;
+const MISSED_MS = 15 * 60 * 1000;
 const lastNotify = new Map();
 
 function bucketFor(code) {
@@ -141,13 +144,14 @@ async function handlePush(req, store, bucket, cors, push, now) {
     if (t - (lastNotify.get(bucket) || 0) < NOTIFY_GAP_MS) return reply(429, { error: 'too many' });
     lastNotify.set(bucket, t);
     const role = typeof req.body?.role === 'string' ? req.body.role : '';
+    const payload = cleanPayload(req.body?.payload);
     const list = await read();
     const targets = list.filter(s => (!role || s.role === role) && s.endpoint !== req.body?.skip);
     const dead = new Set();
     let sent = 0;
     await Promise.all(targets.map(async (s) => {
       try {
-        const status = await push.send(s);
+        const status = await push.send(s, payload);
         if (status === 404 || status === 410) dead.add(s.endpoint);
         else if (status >= 200 && status < 300) sent += 1;
       } catch (e) { /* an unreachable push service is not a reason to fail the request */ }
@@ -157,7 +161,58 @@ async function handlePush(req, store, bucket, cors, push, now) {
     return reply(200, { sent });
   }
 
+  // The list of reminders to send later (for example "a rule starts in ten
+  // minutes"). A device replaces the whole list each time it posts, so
+  // changing the source of the reminders also changes what is still pending.
+  if (route === 'POST /push/schedule') {
+    const t = now();
+    const items = (Array.isArray(req.body?.items) ? req.body.items : [])
+      .map(i => ({ at: Number(i?.at), role: typeof i?.role === 'string' ? i.role.slice(0, 20) : '', payload: cleanPayload(i?.payload) }))
+      .filter(i => Number.isFinite(i.at) && i.at > t && i.at < t + MAX_AHEAD_MS && i.payload)
+      .sort((a, b) => a.at - b.at)
+      .slice(0, MAX_SCHEDULED);
+    await store.write(`sched-${bucket}`, items);
+    return reply(200, { scheduled: items.length });
+  }
+
   return reply(404, { error: 'not found' });
+}
+
+// Only a small object of short strings goes into a notification.
+export function cleanPayload(p) {
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
+  const out = {};
+  for (const [k, v] of Object.entries(p)) {
+    if (typeof v === 'string' && /^[a-z]{1,10}$/.test(k)) out[k] = v.slice(0, 240);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+// Called on a timer by the server: sends what is due, drops what was missed by
+// more than MISSED_MS (a server that was down must not fire last week's).
+export async function runSchedule(store, buckets, push, now = Date.now) {
+  let sent = 0;
+  for (const bucket of buckets) {
+    const items = await store.read(`sched-${bucket}`);
+    if (!Array.isArray(items) || items.length === 0) continue;
+    const t = now();
+    const due = items.filter(i => i.at <= t);
+    if (!due.length) continue;
+    const subs = await store.read(`push-${bucket}`);
+    const dead = new Set();
+    for (const item of due.filter(i => t - i.at <= MISSED_MS)) {
+      for (const sub of (Array.isArray(subs) ? subs : []).filter(x => !item.role || x.role === item.role)) {
+        try {
+          const status = await push.send(sub, item.payload);
+          if (status === 404 || status === 410) dead.add(sub.endpoint);
+          else if (status >= 200 && status < 300) sent += 1;
+        } catch (e) { /* try again never: the next reminder is another one */ }
+      }
+    }
+    await store.write(`sched-${bucket}`, items.filter(i => i.at > t));
+    if (dead.size) await store.write(`push-${bucket}`, subs.filter(x => !dead.has(x.endpoint)));
+  }
+  return sent;
 }
 
 export { bucketFor, MAX_BYTES, NOTIFY_GAP_MS };

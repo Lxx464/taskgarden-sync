@@ -1,6 +1,6 @@
 FROM node:alpine
 WORKDIR /app
-COPY src/handler.js src/index.js ./
+COPY src/handler.js src/index.js src/webpush.js ./
 # No dependencies on purpose: node:http and node:fs are enough, and a sync
 # service that holds your data is the last place to want a dependency tree.
 RUN echo '{"type":"module"}' > package.json
