@@ -227,4 +227,17 @@ describe('push', () => {
     expect(got).toEqual([['https://push.example/1', 'due']]);
     expect(store.data[`sched-${b}`].map(i => i.payload.k)).toEqual(['later']);
   });
+
+  it('a device can hold several roles and the status counts them', async () => {
+    const store = memoryStore();
+    const sub = (endpoint, role) => handle(post('/push/subscribe', { role, subscription: { endpoint } }), store, ctx());
+    await sub('https://push.example/phone', 'luca,mia');
+    await sub('https://push.example/other', 'luca');
+    const status = await handle(req({ path: '/push/status' }), store, ctx());
+    expect(status.body).toEqual({ devices: { luca: 2, mia: 1 }, total: 2 });
+    const got = [];
+    const p = { publicKey: 'PUB', async send(s) { got.push(s.endpoint); return 201; } };
+    await handle(post('/push/notify', { role: 'mia' }), store, ctx({ push: p, now: () => 70_000_000 }));
+    expect(got).toEqual(['https://push.example/phone']);
+  });
 });

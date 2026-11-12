@@ -126,11 +126,20 @@ async function handlePush(req, store, bucket, cors, push, now) {
     if (typeof endpoint !== 'string' || !/^https:\/\/[^\s/]+/.test(endpoint) || endpoint.length > 1000) {
       return reply(400, { error: 'invalid subscription' });
     }
-    const role = typeof req.body?.role === 'string' ? req.body.role.slice(0, 20) : '';
+    // One device can hold several roles ("luca,mia"): a phone that is both.
+    const role = typeof req.body?.role === 'string' ? req.body.role.replace(/[^a-z,]/g, '').slice(0, 40) : '';
     const list = (await read()).filter(s => s.endpoint !== endpoint);
     list.unshift({ endpoint, keys: sub.keys || null, role });
     await store.write(subsBucket, list.slice(0, MAX_SUBSCRIPTIONS));
     return reply(204);
+  }
+
+  // How many devices are signed up for each role, so a sender can tell
+  // "nobody listens" from "the message did not arrive".
+  if (route === 'GET /push/status') {
+    const counts = {};
+    (await read()).forEach(sub => String(sub.role || '').split(',').filter(Boolean).forEach(r => { counts[r] = (counts[r] || 0) + 1; }));
+    return reply(200, { devices: counts, total: (await read()).length });
   }
 
   if (route === 'POST /push/unsubscribe') {
@@ -146,7 +155,7 @@ async function handlePush(req, store, bucket, cors, push, now) {
     const role = typeof req.body?.role === 'string' ? req.body.role : '';
     const payload = cleanPayload(req.body?.payload);
     const list = await read();
-    const targets = list.filter(s => (!role || s.role === role) && s.endpoint !== req.body?.skip);
+    const targets = list.filter(s => hasRole(s, role) && s.endpoint !== req.body?.skip);
     const dead = new Set();
     let sent = 0;
     await Promise.all(targets.map(async (s) => {
@@ -178,6 +187,8 @@ async function handlePush(req, store, bucket, cors, push, now) {
   return reply(404, { error: 'not found' });
 }
 
+export const hasRole = (sub, role) => !role || String(sub.role || '').split(',').includes(role);
+
 // Only a small object of short strings goes into a notification.
 export function cleanPayload(p) {
   if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
@@ -201,7 +212,7 @@ export async function runSchedule(store, buckets, push, now = Date.now) {
     const subs = await store.read(`push-${bucket}`);
     const dead = new Set();
     for (const item of due.filter(i => t - i.at <= MISSED_MS)) {
-      for (const sub of (Array.isArray(subs) ? subs : []).filter(x => !item.role || x.role === item.role)) {
+      for (const sub of (Array.isArray(subs) ? subs : []).filter(x => hasRole(x, item.role))) {
         try {
           const status = await push.send(sub, item.payload);
           if (status === 404 || status === 410) dead.add(sub.endpoint);
