@@ -15,6 +15,11 @@
 // call — are unit-tested rather than verified by curling a running container.
 
 const MAX_BYTES = 8 * 1024 * 1024;
+const MAX_SUBSCRIPTIONS = 10;
+// One wake-up call per bucket in this window: a client in a loop must not be
+// able to turn this service into a notification cannon.
+const NOTIFY_GAP_MS = 5000;
+const lastNotify = new Map();
 
 function bucketFor(code) {
   // The code names the file, so it must not be able to name a different one.
@@ -41,7 +46,7 @@ export function corsHeaders(origin, allowed) {
   const ok = allowed.includes(origin);
   return {
     'Access-Control-Allow-Origin': ok ? origin : allowed[0] || 'null',
-    'Access-Control-Allow-Methods': 'GET, PUT, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, PUT, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Authorization, Content-Type',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin'
@@ -52,12 +57,13 @@ export function corsHeaders(origin, allowed) {
  * Handle one request against a storage of `{ read(bucket), write(bucket, body) }`.
  * Returns `{ status, body, headers }` — no node:http types in sight.
  */
-export async function handle(req, store, { codes, origins }) {
+export async function handle(req, store, { codes, origins, push = null, now = Date.now }) {
   const cors = corsHeaders(req.headers.origin, origins);
 
   if (req.method === 'OPTIONS') return { status: 204, headers: cors };
 
-  if (req.path !== '/snapshot') {
+  const isPush = req.path.startsWith('/push/');
+  if (req.path !== '/snapshot' && !(isPush && push)) {
     return { status: 404, headers: cors, body: { error: 'not found' } };
   }
 
@@ -67,6 +73,8 @@ export async function handle(req, store, { codes, origins }) {
     return { status: 401, headers: cors, body: { error: 'unauthorized' } };
   }
   const bucket = bucketFor(code);
+
+  if (isPush) return handlePush(req, store, bucket, cors, push, now);
 
   if (req.method === 'GET') {
     const stored = await store.read(bucket);
@@ -94,4 +102,62 @@ export async function handle(req, store, { codes, origins }) {
   return { status: 405, headers: cors, body: { error: 'method not allowed' } };
 }
 
-export { bucketFor, MAX_BYTES };
+// Web Push without a payload: the push service only carries "something
+// happened", the app's service worker shows a fixed notice. So there is no
+// message encryption to get wrong, and nothing readable passes through a
+// third-party push service.
+async function handlePush(req, store, bucket, cors, push, now) {
+  const reply = (status, body) => ({ status, headers: cors, body });
+  const subsBucket = `push-${bucket}`;
+  const read = async () => {
+    const stored = await store.read(subsBucket);
+    return Array.isArray(stored) ? stored : [];
+  };
+  const route = `${req.method} ${req.path}`;
+
+  if (route === 'GET /push/key') return reply(200, { key: push.publicKey });
+
+  if (route === 'POST /push/subscribe') {
+    const sub = req.body?.subscription;
+    const endpoint = sub?.endpoint;
+    if (typeof endpoint !== 'string' || !/^https:\/\/[^\s/]+/.test(endpoint) || endpoint.length > 1000) {
+      return reply(400, { error: 'invalid subscription' });
+    }
+    const role = typeof req.body?.role === 'string' ? req.body.role.slice(0, 20) : '';
+    const list = (await read()).filter(s => s.endpoint !== endpoint);
+    list.unshift({ endpoint, keys: sub.keys || null, role });
+    await store.write(subsBucket, list.slice(0, MAX_SUBSCRIPTIONS));
+    return reply(204);
+  }
+
+  if (route === 'POST /push/unsubscribe') {
+    const endpoint = req.body?.endpoint;
+    await store.write(subsBucket, (await read()).filter(s => s.endpoint !== endpoint));
+    return reply(204);
+  }
+
+  if (route === 'POST /push/notify') {
+    const t = now();
+    if (t - (lastNotify.get(bucket) || 0) < NOTIFY_GAP_MS) return reply(429, { error: 'too many' });
+    lastNotify.set(bucket, t);
+    const role = typeof req.body?.role === 'string' ? req.body.role : '';
+    const list = await read();
+    const targets = list.filter(s => (!role || s.role === role) && s.endpoint !== req.body?.skip);
+    const dead = new Set();
+    let sent = 0;
+    await Promise.all(targets.map(async (s) => {
+      try {
+        const status = await push.send(s);
+        if (status === 404 || status === 410) dead.add(s.endpoint);
+        else if (status >= 200 && status < 300) sent += 1;
+      } catch (e) { /* an unreachable push service is not a reason to fail the request */ }
+    }));
+    // A subscription the push service has forgotten is dropped, so the list does not rot.
+    if (dead.size) await store.write(subsBucket, list.filter(s => !dead.has(s.endpoint)));
+    return reply(200, { sent });
+  }
+
+  return reply(404, { error: 'not found' });
+}
+
+export { bucketFor, MAX_BYTES, NOTIFY_GAP_MS };

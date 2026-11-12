@@ -17,6 +17,7 @@
 
 import { createServer } from 'node:http';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { createPrivateKey, generateKeyPairSync, sign } from 'node:crypto';
 import { join } from 'node:path';
 import { handle, MAX_BYTES } from './handler.js';
 
@@ -53,6 +54,43 @@ const fileStore = {
     await rename(tmp, target);
   }
 };
+
+// Web Push needs a VAPID key pair so push services know who is calling. It is
+// made on first start and kept in the data volume — nothing to configure.
+const b64url = (buf) => Buffer.from(buf).toString('base64url');
+
+async function loadVapid() {
+  const file = join(DATA_DIR, 'vapid.json');
+  let jwk;
+  try {
+    jwk = JSON.parse(await readFile(file, 'utf8'));
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    jwk = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey.export({ format: 'jwk' });
+    await writeFile(file, JSON.stringify(jwk), { encoding: 'utf8', mode: 0o600 });
+  }
+  const key = createPrivateKey({ key: jwk, format: 'jwk' });
+  // The uncompressed point: 0x04 || x || y.
+  const publicKey = b64url(Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]));
+  const subject = process.env.SYNC_PUSH_SUBJECT || ORIGINS[0] || 'https://localhost';
+
+  return {
+    publicKey,
+    // A wake-up call with no body. Resolves to the push service's status code.
+    async send(subscription) {
+      const aud = new URL(subscription.endpoint).origin;
+      const head = b64url(JSON.stringify({ typ: 'JWT', alg: 'ES256' }));
+      const claims = b64url(JSON.stringify({ aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: subject }));
+      const signature = sign('sha256', Buffer.from(`${head}.${claims}`), { key, dsaEncoding: 'ieee-p1363' });
+      const res = await fetch(subscription.endpoint, {
+        method: 'POST',
+        headers: { Authorization: `vapid t=${head}.${claims}.${b64url(signature)}, k=${publicKey}`, TTL: '3600', Urgency: 'high' },
+        signal: AbortSignal.timeout(10000)
+      });
+      return res.status;
+    }
+  };
+}
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -93,7 +131,7 @@ const server = createServer(async (req, res) => {
     send(await handle(
       { method: req.method, path: url.pathname, headers: req.headers, body },
       fileStore,
-      { codes: CODES, origins: ORIGINS }
+      { codes: CODES, origins: ORIGINS, push }
     ));
   } catch (e) {
     if (e.tooLarge) return send({ status: 413, body: { error: 'snapshot too large' } });
@@ -104,6 +142,7 @@ const server = createServer(async (req, res) => {
 });
 
 await mkdir(DATA_DIR, { recursive: true });
+const push = await loadVapid();
 server.listen(PORT, () => {
   console.log(`TaskGarden sync on :${PORT}, data in ${DATA_DIR}, ${CODES.length} code(s)`);
 });

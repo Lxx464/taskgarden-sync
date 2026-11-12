@@ -136,3 +136,54 @@ describe('cors', () => {
     expect(res.status).toBe(204);
   });
 });
+
+describe('push', () => {
+  const sent = [];
+  const push = { publicKey: 'PUB', async send(sub) { sent.push(sub.endpoint); return sub.endpoint.includes('gone') ? 410 : 201; } };
+  const ctx = (over = {}) => ({ codes: CODES, origins: ORIGINS, push, now: () => 1_000_000, ...over });
+  const post = (path, body, over = {}) => req({ method: 'POST', path, body, ...over });
+
+  beforeEach(() => { sent.length = 0; });
+
+  it('is not there when no push service is configured', async () => {
+    const res = await handle(req({ path: '/push/key' }), memoryStore(), { codes: CODES, origins: ORIGINS });
+    expect(res.status).toBe(404);
+  });
+
+  it('needs the code and hands out the public key', async () => {
+    const store = memoryStore();
+    expect((await handle(req({ path: '/push/key', headers: { origin: ORIGINS[0] } }), store, ctx())).status).toBe(401);
+    const ok = await handle(req({ path: '/push/key' }), store, ctx());
+    expect(ok.body).toEqual({ key: 'PUB' });
+  });
+
+  it('stores subscriptions per code, rejecting anything that is no https endpoint', async () => {
+    const store = memoryStore();
+    expect((await handle(post('/push/subscribe', { subscription: { endpoint: 'http://x/1' } }), store, ctx())).status).toBe(400);
+    expect((await handle(post('/push/subscribe', { role: 'luca', subscription: { endpoint: 'https://push.example/1', keys: { p256dh: 'a', auth: 'b' } } }), store, ctx())).status).toBe(204);
+    await handle(post('/push/subscribe', { role: 'luca', subscription: { endpoint: 'https://push.example/1' } }), store, ctx());
+    expect(store.data[`push-${bucketFor('code-luca')}`]).toHaveLength(1);
+    expect(store.data[`push-${bucketFor('code-gast')}`]).toBeUndefined();
+  });
+
+  it('notifies the matching subscriptions, skips the sender and drops dead ones', async () => {
+    const store = memoryStore();
+    const sub = (endpoint, role) => handle(post('/push/subscribe', { role, subscription: { endpoint } }), store, ctx());
+    await sub('https://push.example/luca', 'luca');
+    await sub('https://push.example/gone', 'luca');
+    await sub('https://push.example/mia', 'mia');
+    const res = await handle(post('/push/notify', { role: 'luca' }), store, ctx());
+    expect(res.body).toEqual({ sent: 1 });
+    expect(sent.sort()).toEqual(['https://push.example/gone', 'https://push.example/luca']);
+    expect(store.data[`push-${bucketFor('code-luca')}`].map(s => s.endpoint).sort()).toEqual(['https://push.example/luca', 'https://push.example/mia']);
+  });
+
+  it('rate-limits notify per code', async () => {
+    const store = memoryStore();
+    await handle(post('/push/notify', {}), store, ctx({ now: () => 5_000_000 }));
+    const again = await handle(post('/push/notify', {}), store, ctx({ now: () => 5_001_000 }));
+    expect(again.status).toBe(429);
+    const later = await handle(post('/push/notify', {}), store, ctx({ now: () => 5_010_000 }));
+    expect(later.status).toBe(200);
+  });
+});

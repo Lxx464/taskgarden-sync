@@ -93,6 +93,7 @@ docker exec taskgarden-sync printenv SYNC_CODES
 | `SYNC_CODES` | Comma-separated pairing codes. **Required** — the service refuses to start without one. Each code is its own bucket, so several people can share one instance and none can reach another's data. |
 | `SYNC_ORIGINS` | Comma-separated origins allowed to call it from a different origin. Defaults to `https://todo.celexstrategy.com`, the public website. Needed only when the app is served from another address *and* talks to this service directly; when it reaches it through a path on its own domain (see above), leave it alone. |
 | `SYNC_DATA` | Where the blobs go. Default `/data`. |
+| `SYNC_PUSH_SUBJECT` | Contact the push services see with a wake-up call (an `https:` or `mailto:` address). Defaults to the first origin. |
 | `PORT` | Default `8080`. |
 
 The origin list is deliberately not a wildcard: any page open in your browser
@@ -111,6 +112,24 @@ reason the service exists in this shape at all: conflating them is how a wrong
 code would silently overwrite someone's data.
 
 Snapshots above 8 MB are rejected with `413`.
+
+### Wake-up calls (Web Push)
+
+The service can wake a device whose app is closed. It carries no message, only
+"something is waiting"; the app's service worker decides what to show. Keys are
+made on first start and kept in the data volume (`vapid.json`), so there is
+nothing to configure — the container must be able to reach the browsers' push
+services over HTTPS.
+
+    GET  /push/key          → { "key": "<public key>" }
+    POST /push/subscribe    { subscription, role }      → 204
+    POST /push/unsubscribe  { endpoint }                → 204
+    POST /push/notify       { role?, skip? }            → { sent: n }
+    Authorization: Bearer <pairing code>
+
+Subscriptions are stored per code (at most ten). One `notify` per code every
+five seconds is answered; more get `429`. A subscription the push service no
+longer knows is dropped on the next `notify`.
 
 The service sends no `ETag` or cache headers. Clients that want to notice a
 change cheaply (TaskGarden's live check) compare a digest of the body
