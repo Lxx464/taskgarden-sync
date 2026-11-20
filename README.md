@@ -7,8 +7,9 @@ It holds one JSON document per pairing code and hands it back. It does not
 merge, it does not validate, and with encryption switched on in the app it
 cannot read what it holds — the client seals the payload before it is sent.
 
-Two files, no dependencies. Everything the service does is in `src/handler.js`
-(the rules) and `src/index.js` (a `node:http` server and a file on disk).
+Three files, no runtime dependencies. Everything the service does is in
+`src/handler.js` (the rules), `src/index.js` (a `node:http` server and a file
+on disk) and `src/webpush.js` (wake-up calls).
 
 ## Run it
 
@@ -158,8 +159,9 @@ npm install
 npm test
 ```
 
-The tests (`src/handler.test.js`) cover `handler.js` alone: who is let in, what a missing snapshot
-returns, which origins may call. Those are the rules worth having a test for,
+The tests (`src/handler.test.js`, `src/webpush.test.js`) cover the rules and
+the push encryption: who is let in, what a missing snapshot returns, which
+origins may call. Those are the rules worth having a test for,
 and they are the reason they live away from `node:http` rather than being
 verified by curling a running container.
 
